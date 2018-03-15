@@ -1,0 +1,153 @@
+!$
+!===================================================================================================
+!
+!   control subroutine for transient execution (point kinetics method) 
+!---------------------------------------------------------------------------------------------------
+!   Public subroutine lists:    Run_transient_pk
+!
+!   Public type lists:          No
+!
+!===================================================================================================
+module driver_transient_pk
+    
+    use constants
+    use global_state
+    use, intrinsic  :: ISO_FORTRAN_ENV
+    
+    use global
+    
+    use transit_from_solver,        only : Transit_precursor
+    use feedback,                   only : Check_feedback_transient, Check_xsec_transient
+
+    use time_advancing,             only : Get_initial_precursor
+    use perturbation,               only : Perform_perturbation
+    use coefficient_pk_header
+    use process_pcqs
+    use process_pk,                 only : Pk_solver_RBDF, Pk_solver_VODE, Print_step_info
+    
+    use output_timelist,            only : Print_timelist
+    use output_hdf5,                only : Print_binary_hdf5
+    use output_visit,               only : Print_vtk_files
+    
+    use timestep_header,            only : TimeStepInfo
+    
+    implicit none
+    private
+    public  :: Run_transient_pk
+   
+contains
+    !$
+    !===============================================================================================
+    !
+    !===============================================================================================
+    subroutine Run_transient_pk ()
+    
+        type(TimeStepInfo)  :: step_Macro, step_Medial
+        integer             :: i_Macro, i_Medial
+        integer             :: id_Macro, id_Medial
+        real(KREAL)         :: ctime, ltime
+        integer             :: id_Total
+        logical             :: is_pass
+        
+        ! ----------------------------------------------------------------------
+        ! obtain initial flux and precursor concentration
+        step_Macro = time_step%info (0, is_step=.FALSE.)
+        step_Medial = time_step%info (0, is_step=.TRUE.)
+        
+        call dnp_solver%init (mesh, geom, xsec, param, flux_forward, dist_dnps, timelist)
+!        call Get_initial_precursor ()
+!        call Transit_precursor ()
+        
+        ! obtain initial shape function
+        call Normal_adjoint_flux ()
+        call Get_initial_flux_shape ()
+        
+        ! generate point kinetics parameters
+        call Generate_pk_parameter (0)
+        call Generate_reactivity (0)
+        
+        ! initial condition for pk equation
+        call Get_initial_amplitude ()
+        call Get_initial_precursor_shape()
+        
+        pk_param%neutron = 1.0D0
+        pk_param%precursor = pk_param%partial_beta / pk_param%partial_lambda / pk_param%generation_time 
+        
+        ! ----------------------------------------------------------------------
+        ! time advance for micro time step        
+        id_Total = 0
+        id_Macro = 0
+        macro: do i_Macro = 1, time_step%get_section_count ()
+            id_Macro = id_Macro + 1
+            step_Macro = time_step%info (id_Macro, is_step=.FALSE.)    
+            
+            ! cycle for micro time step
+            id_Medial = 0
+            medial: do i_Medial = 1, time_step%step_per_section(i_Macro)
+                id_Medial = id_Medial + 1
+                id_Total = id_Total + 1
+                step_Medial = time_step%info (id_Total, is_step=.TRUE.)  
+            
+                ctime = step_Medial%right
+                ltime = ctime - step_Medial%pace
+                
+                call Perform_perturbation (id_Total, ctime)
+                call Check_xsec_transient ()
+                
+                ! generate reactivity per time step
+                call Generate_pk_parameter (id_Total)
+                call Generate_reactivity (id_Total)
+                call pk_solver%advance (pk_param, left=ltime, right=ctime)
+                
+                amplitude%flux = pk_param%neutron
+                amplitude%precursor = pk_param%precursor
+                
+                call Regenerate_power (id_Total)
+                call dnp_solver%advance (mesh, xsec, param, flux_forward, dist_dnps, step_Medial)
+                
+                ! treatment feedback
+                call Check_feedback_transient (is_pass, step_Medial%left, step_Medial%right)
+                call Print_transient_pk_timelist (id_Total, ctime)
+            end do medial
+            
+            call Print_transient_pk_dist (id_Total, ctime)
+        end do macro
+        
+    end subroutine Run_transient_pk
+    
+    ! --------------------------------------------------------------------------
+    ! --------------------------------------------------------------------------
+    
+    !$
+    !===============================================================================================
+    !
+    !===============================================================================================
+    subroutine Print_transient_pk_timelist (tidx, ctime)
+        
+        integer, intent(in)  :: tidx
+        real(KREAL), intent(in)  :: ctime
+        
+        integer  :: ia 
+        
+        call timelist%set (geom, mesh, dist_power, self_fdbk, pk_parameter%rho, pk_parameter%beta)
+        call Print_timelist (timelist, tidx, ctime, FILES%TIMELIST)
+        call det%get (ns, geom, mesh, flux_forward)
+        call det%pvalue (FILES%DET, tidx, ctime)
+        
+    end subroutine Print_transient_pk_timelist
+    
+    !$
+    !===============================================================================================
+    !
+    !===============================================================================================
+    subroutine Print_transient_pk_dist (tidx, ctime)
+        
+        integer, intent(in)  :: tidx
+        real(KREAL), intent(in)  :: ctime
+        
+        call Print_binary_hdf5 (is_adjoint=.FALSE., is_transient=.TRUE., tidx=tidx, ctime=ctime)
+        call Print_vtk_files (is_adjoint=.FALSE., is_transient=.TRUE., tidx=tidx, ctime=ctime)
+        
+    end subroutine Print_transient_pk_dist
+    
+end module driver_transient_pk
